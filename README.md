@@ -1,162 +1,323 @@
 # Print Tracker
 
 Monitor en tiempo real de trabajos de impresión físicos en Windows.
-Muestra cuántas páginas se imprimieron realmente (ej: "33 / 100") en lugar de solo "enviado a la impresora".
+Muestra quién está imprimiendo, cuántas páginas pidió y cuántas van saliendo — ej: "maria → Informe.pdf → 33 / 100". Guarda historial completo de todos los trabajos y eventos del sistema.
 
 ## Arquitectura
 
-```
-backend/   Python + FastAPI  →  lee la cola de Windows via win32print
-frontend/  (próximamente)    →  consume la API REST y WebSocket
-```
-
-### Escenario de oficina
-
-Cada usuario tiene su propia PC. Cuando quieren imprimir, mandan el trabajo a la PC-A (la que tiene las impresoras conectadas). El backend corre en PC-A y ve los trabajos de **todos los usuarios** porque Windows guarda el usuario de red de origen en el spooler.
+No hay PC central dedicada. Cada usuario tiene su notebook. El servidor corre en Render (nube) y la base de datos en Upstash (Redis).
 
 ```
-PC usuario 1 (maria)  ──┐
-PC usuario 2 (carlos) ──┤──▶  PC-A (print server)  ──▶  Impresora 1
-PC usuario 3 (juan)   ──┘     backend Python         ──▶  Impresora 2
-                                    │
-                             http://IP-PC-A:8000
-                                    │
-                         Cualquier navegador de la oficina
+Notebook maria  (agent) ──POST──▶
+Notebook carlos (agent) ──POST──▶  Render (servidor)  ──▶  Upstash (Redis)
+Notebook juan   (agent) ──POST──▶                      ──▶  Frontend
 ```
 
-## Requisitos
+Si se corta internet en la oficina, el agente guarda todo en `pending.json` y lo manda al servidor cuando vuelve la conexión — sin perder datos.
 
-- Windows 10/11
-- Python 3.11+
-- Las impresoras instaladas en la PC donde corre el backend
+```
+backend/
+  agent/
+    agent.py          →  corre en cada notebook (Windows)
+    requirements.txt
+  server/
+    main.py           →  corre en Render
+    requirements.txt
+instalar.bat          →  instala el agente como servicio de Windows
+desinstalar.bat       →  desinstala el agente (requiere clave)
+detener.bat           →  detiene el agente (requiere clave)
+iniciar.bat           →  inicia el agente (requiere clave)
+```
 
-## Levantar el backend
+---
+
+## Antes de ir a la oficina (desde tu PC)
+
+### 1. Compilar el agente en un .exe
 
 ```bash
-cd backend
-pip install -r requirements.txt
-python main.py
+pip install pyinstaller
+cd backend/agent
+pyinstaller --onefile agent.py
+# genera: backend/agent/dist/agent.exe
 ```
 
-El servidor arranca en `http://localhost:8000`.  
-Desde otras PCs de la oficina: `http://IP-DE-LA-PC:8000`.
+### 2. Descargar nssm.exe
+
+Entrar a `https://nssm.cc/download`, descargar el ZIP y extraer `win64\nssm.exe`.
+
+### 3. Cambiar la clave en los .bat
+
+Abrir [desinstalar.bat](desinstalar.bat), [detener.bat](detener.bat) e [iniciar.bat](iniciar.bat) y reemplazar `admin1234` por la clave real en los tres archivos.
+
+### 4. Editar instalar.bat con la URL del servidor
+
+Abrir [instalar.bat](instalar.bat) y cambiar:
+```bat
+set SERVER_URL=http://TU_IP_SERVIDOR:8000
+```
+Por la URL de Render:
+```bat
+set SERVER_URL=https://print-tracker.onrender.com
+```
+
+### 5. Subir a GitHub Releases
+
+1. Entrar a `github.com/tu-usuario/print-tracker` → **Releases** → **Create a new release**
+2. Tag: `v1.0.0`
+3. Subir los 6 archivos como assets:
+   - `backend/agent/dist/agent.exe`
+   - `nssm.exe`
+   - `instalar.bat`
+   - `desinstalar.bat`
+   - `detener.bat`
+   - `iniciar.bat`
+4. **Publish release**
+
+---
+
+## Deploy del servidor en Render
+
+### 1. Crear la base de datos en Upstash
+
+1. Entrar a `upstash.com` y crear una cuenta
+2. Crear una base de datos Redis → elegir la región más cercana
+3. Copiar la **Redis URL** (formato: `rediss://default:password@host:port`)
+
+### 2. Deploy en Render
+
+1. Entrar a `render.com` y crear una cuenta
+2. **New** → **Web Service** → conectar el repo de GitHub
+3. Configurar:
+   - **Root directory:** `backend/server`
+   - **Build command:** `pip install -r requirements.txt`
+   - **Start command:** `python main.py`
+4. En **Environment Variables** agregar:
+   - `UPSTASH_REDIS_URL` → pegar la Redis URL de Upstash
+5. **Deploy**
+
+Verificar que funciona abriendo `https://tu-app.onrender.com/printers` en el navegador.
+
+---
+
+## Instalación del agente en cada notebook
+
+### Opción A — GitHub Releases (recomendada)
+
+1. Abrir el navegador y entrar a `github.com/tu-usuario/print-tracker/releases`
+2. Descargar los 6 archivos en la misma carpeta
+3. Clic derecho en `instalar.bat` → **Ejecutar como administrador**
+
+El agente queda instalado como servicio de Windows, arranca automáticamente con la notebook y solo puede detenerse o desinstalarse con clave.
+
+### Opción B — ZIP del repo
+
+1. Entrar a `github.com/tu-usuario/print-tracker` → **Code** → **Download ZIP**
+2. Extraer el ZIP
+3. Clic derecho en `instalar.bat` → **Ejecutar como administrador**
+
+### Opción C — PowerShell
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "Invoke-WebRequest https://github.com/tu-usuario/print-tracker/releases/latest/download/instalar.bat -OutFile instalar.bat; .\instalar.bat"
+```
+
+### Verificar que funciona
+
+Abrir en el navegador:
+```
+https://tu-app.onrender.com/agents
+```
+La notebook instalada tiene que aparecer con `"online": true`.
+
+---
+
+## Gestión del agente (requiere clave)
+
+| Script | Qué hace |
+|---|---|
+| `instalar.bat` | Instala el agente como servicio (sin clave) |
+| `detener.bat` | Detiene el agente sin desinstalarlo |
+| `iniciar.bat` | Vuelve a iniciar el agente |
+| `desinstalar.bat` | Detiene, elimina el servicio y borra los archivos |
+
+Todos los scripts excepto `instalar.bat` requieren clave de administrador. Los usuarios estándar no pueden detener el servicio directamente desde Windows porque los permisos del servicio están restringidos por `sc sdset` durante la instalación.
+
+Cuando el agente se detiene o se inicia, el servidor lo registra automáticamente y el frontend puede mostrarlo.
+
+---
+
+## Qué pasa si se corta internet
+
+El agente detecta que el servidor no responde y guarda cada cambio en `pending.json` en `C:\PrintTracker\`. Cuando vuelve internet, manda todo en orden antes de seguir reportando normal.
+
+```
+Internet se corta:
+  → agente guarda en pending.json
+  → sigue guardando cada cambio
+
+Internet vuelve:
+  → agente manda todo pending.json al servidor en orden
+  → servidor guarda el historial completo en Redis
+  → frontend muestra todo lo que pasó mientras no había internet
+```
+
+---
+
+## Agregar features y deployar
+
+**1. Desarrollar y pushear desde tu PC:**
+```bash
+git add .
+git commit -m "nueva feature"
+git push
+```
+
+**2. Servidor en Render:** se redeploya automáticamente con cada push a `main`.
+
+**3. Agentes en las notebooks** (solo si cambió `agent.py`):
+- Compilar nuevo `agent.exe` con PyInstaller
+- Subir nueva versión a GitHub Releases
+- En cada notebook: descargar el nuevo `agent.exe`, reemplazar en `C:\PrintTracker\` y ejecutar:
+```bash
+nssm restart PrintTrackerAgent
+```
+
+---
+
+## Soporte remoto
+
+**AnyDesk** — instalar en las notebooks de la oficina y en la tuya. Cuando algo falla, conectarse con el ID de esa notebook.
+
+**Tailscale** — crea una VPN privada entre todas las notebooks sin tocar el router. Permite reiniciar servicios y ver logs desde cualquier red.
+
+**Comandos útiles de NSSM:**
+```bash
+nssm status PrintTrackerAgent     # ver estado
+nssm restart PrintTrackerAgent    # reiniciar (requiere admin de Windows)
+```
+
+---
 
 ## API
 
-| Método | Ruta                       | Descripción                                      |
-|--------|----------------------------|--------------------------------------------------|
-| GET    | `/printers`                | Lista todas las impresoras y sus trabajos activos |
-| GET    | `/printers/{printer_name}` | Detalle de una impresora específica              |
-| WS     | `/ws`                      | WebSocket: push de actualizaciones cada ~1 seg   |
+| Método | Ruta            | Descripción                                            |
+|--------|-----------------|--------------------------------------------------------|
+| POST   | `/agent/report` | Usado por los agentes para reportar su cola local      |
+| POST   | `/agent/event`  | Usado por los agentes para reportar inicio/detención   |
+| GET    | `/printers`     | Todos los trabajos activos agrupados por impresora     |
+| GET    | `/agents`       | Vista por notebook: quién está online y qué imprime    |
+| GET    | `/history`      | Historial de trabajos terminados                       |
+| GET    | `/events`       | Historial de eventos (agente iniciado/detenido)        |
+| WS     | `/ws`           | WebSocket: push en tiempo real                         |
 
-### Ejemplo de respuesta (`/printers`)
+### Filtros de `/history`
+
+```
+GET /history?user=maria
+GET /history?printer=HP-Oficina
+GET /history?user=maria&printer=HP-Oficina&limit=50
+```
+
+### Ejemplo — `GET /printers`
 
 ```json
 [
   {
-    "name": "HP-Oficina",
-    "status": ["printing"],
+    "printer_name": "HP-Oficina",
     "jobs": [
       {
         "job_id": 42,
+        "hostname": "MARIA-PC",
         "user": "maria",
         "document": "Informe.pdf",
         "pages_printed": 33,
         "total_pages": 100,
         "status": ["printing"],
         "submitted": "2026-04-21T10:30:00"
-      },
-      {
-        "job_id": 43,
-        "user": "carlos",
-        "document": "Factura.xlsx",
-        "pages_printed": 2,
-        "total_pages": 5,
-        "status": ["spooling"],
-        "submitted": "2026-04-21T10:31:00"
       }
     ]
-  },
-  {
-    "name": "Canon-Color",
-    "status": ["ready"],
-    "jobs": []
   }
 ]
 ```
 
-### WebSocket (`ws://localhost:8000/ws`)
+### Ejemplo — `GET /history`
 
-Al conectar recibe `{"event": "init", "data": [...]}` con el estado actual.  
-Cada segundo recibe `{"event": "update", "data": [...]}` con el estado actualizado.
-
-## Cómo funciona el backend
-
-El flujo tiene tres capas:
-
-### 1. Windows Spooler (la fuente de datos)
-
-Cuando un usuario manda a imprimir desde su PC, el spooler de Windows en PC-A recibe el trabajo y registra:
-
-- Quién lo mandó (`user`)
-- Qué archivo es (`document`)
-- Cuántas páginas tiene en total (`total_pages`)
-- Cuántas páginas se imprimieron físicamente hasta ahora (`pages_printed`) — este valor se actualiza en tiempo real mientras la impresora trabaja
-
-### 2. `print_monitor.py` (el lector)
-
-Un hilo de fondo se ejecuta cada 1 segundo y hace lo siguiente:
-
-**Paso 1** — pregunta a Windows qué impresoras existen y su estado:
-```
-HP-Oficina   →  status: 0x00000400  →  ["printing"]
-Canon-Color  →  status: 0x00000000  →  ["ready"]
+```json
+[
+  {
+    "job_id": 41,
+    "hostname": "CARLOS-PC",
+    "user": "carlos",
+    "printer_name": "HP-Oficina",
+    "document": "Factura.xlsx",
+    "pages_printed": 5,
+    "total_pages": 5,
+    "status": ["complete"],
+    "submitted": "2026-04-21T09:15:00",
+    "ended_at": "2026-04-21T09:16:30"
+  }
+]
 ```
 
-**Paso 2** — el estado de Windows es un número binario donde cada bit significa algo distinto. Lo decodificamos a texto legible. Por ejemplo `0x00000028` significa `["paper_out", "manual_feed"]` al mismo tiempo.
+### Ejemplo — `GET /events`
 
-**Paso 3** — para cada impresora, abre la cola y lee todos los trabajos activos:
-```python
-win32print.EnumJobs(handle, 0, 9999, level=2)
-# level=2 es el único que incluye PagesPrinted
+```json
+[
+  {
+    "hostname": "MARIA-PC",
+    "user": "maria",
+    "type": "stopped",
+    "timestamp": "2026-04-21T10:35:00"
+  },
+  {
+    "hostname": "MARIA-PC",
+    "user": "maria",
+    "type": "started",
+    "timestamp": "2026-04-21T08:00:00"
+  }
+]
 ```
 
-**Paso 4** — con el estado completo, notifica a todos los clientes WebSocket conectados.
+### WebSocket (`wss://tu-app.onrender.com/ws`)
 
-### 3. `main.py` (el servidor HTTP)
+| Evento | Cuándo se dispara |
+|---|---|
+| `init` | Al conectar — estado actual completo |
+| `update` | Cada vez que un agente reporta cambios |
+| `agent_event` | Cuando un agente se inicia o detiene |
 
-Expone los datos de dos formas:
+---
 
-- **REST** (`GET /printers`): devuelve el último snapshot guardado en memoria, sin ir a Windows cada vez.
-- **WebSocket** (`WS /ws`): cuando un navegador se conecta recibe el estado actual, y después recibe un push automático cada vez que algo cambia.
+## Cómo funciona
 
-El hilo de polling es síncrono y el servidor es asíncrono (asyncio). El puente entre ambos mundos es `asyncio.run_coroutine_threadsafe`, que permite al hilo enviar mensajes a los WebSockets sin bloquear el servidor.
+### Agente (`agent.py`)
 
-### Timeline de ejemplo
+Corre en cada notebook. Al arrancar manda evento `started`. Al cerrarse manda evento `stopped`. Cada segundo compara el estado actual de la cola con el último estado enviado. Si cambió algo:
 
-```
-t=0s    python main.py arranca, hilo de polling se inicia
+1. Intenta mandar primero todo lo que esté en `pending.json`
+2. Si el servidor responde, manda el estado actual
+3. Si el servidor no responde, agrega el estado actual a `pending.json`
 
-t=5s    maria manda a imprimir Informe.pdf (100 páginas) desde su PC
-        Windows spooler lo registra en PC-A
+Solo guarda cuando algo cambia — no genera entradas idénticas.
 
-t=6s    hilo lee → HP-Oficina: job 42, maria, 0/100, spooling
-        → navegadores reciben el update
+### Servidor (`server/main.py`)
 
-t=7s    la impresora empieza a imprimir físicamente
-        hilo lee → job 42, maria, 1/100, printing
+Recibe los reportes y:
+- Detecta trabajos que desaparecieron de la cola → los guarda en Redis como historial
+- Actualiza el estado en memoria para tiempo real
+- Recibe eventos de inicio/detención → los guarda en Redis
+- Empuja todos los cambios a los clientes WebSocket conectados
 
-t=40s   hilo lee → job 42, maria, 33/100, printing
-        → navegadores muestran "33 / 100"
+### Redis (Upstash)
 
-t=41s   papel atascado
-        hilo lee → HP-Oficina status: ["paper_jam"]
-                   job 42, maria, 33/100, paused
-        → navegadores reflejan el atasco en tiempo real
+Dos sorted sets ordenados por timestamp:
 
-t=42s   alguien destasca el papel, sigue imprimiendo
-        hilo lee → job 42, maria, 34/100, printing
+| Key | Contenido | Máximo |
+|---|---|---|
+| `print:history` | Trabajos terminados | 10.000 entradas |
+| `print:events` | Eventos inicio/detención | 1.000 entradas |
 
-t=106s  trabajo terminado
-        job 42 desaparece de la cola (Windows lo elimina automáticamente)
-```
+Las entradas más viejas se eliminan automáticamente cuando se alcanza el límite.
+
+Un agente se considera **offline** si no reportó en los últimos 10 segundos.
